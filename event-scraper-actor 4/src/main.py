@@ -180,18 +180,37 @@ async def scrape_instagram(client, url, apify_token):
                     Actor.log.warning(f"Instagram returned error: {item.get('error')} - {item.get('errorDescription', '')}")
                 else:
                     caption = item.get("caption", "") or ""
-                    # Get image URL from various possible fields
+                    post_type = item.get("type", "").lower()
+
+                    # Get image/thumbnail URL based on post type
                     image_url = ""
+
+                    # 1. Direct display URL (works for Image and Sidecar posts)
                     if item.get("displayUrl"):
                         image_url = item["displayUrl"]
-                    elif item.get("images") and len(item["images"]) > 0:
+
+                    # 2. For video/reel posts, grab the thumbnail
+                    if not image_url and item.get("videoUrl"):
+                        # Videos have a thumbnail in displayUrl usually,
+                        # but if not, check other fields
+                        if item.get("previewUrl"):
+                            image_url = item["previewUrl"]
+
+                    # 3. Check images array (carousel/sidecar posts)
+                    if not image_url and item.get("images") and len(item["images"]) > 0:
                         image_url = item["images"][0]
+
+                    # 4. Check childPosts for carousel first image
+                    if not image_url and item.get("childPosts") and len(item["childPosts"]) > 0:
+                        first_child = item["childPosts"][0]
+                        image_url = first_child.get("displayUrl", "") or first_child.get("imageUrl", "")
 
                     # Get owner info
                     owner_username = item.get("ownerUsername", "") or ""
 
                     Actor.log.info(f"Instagram scraper got caption: {len(caption)} chars")
                     Actor.log.info(f"Instagram scraper got image: {'yes' if image_url else 'no'}")
+                    Actor.log.info(f"Instagram post type: {post_type}")
                     return {
                         "caption": caption,
                         "image_url": image_url,
@@ -237,19 +256,23 @@ async def scrape_tiktok(client, url, apify_token):
             },
             timeout=120,
         )
-        if resp.status_code == 200:
+        if resp.status_code in (200, 201):
             items = resp.json()
             if items and len(items) > 0:
                 item = items[0]
                 caption = item.get("text", "") or item.get("desc", "") or ""
                 image_url = ""
-                cover = item.get("videoMeta", {}).get("coverUrl", "")
-                if cover:
-                    image_url = cover
+
+                # TikTok videos always have cover/thumbnail images
+                if item.get("videoMeta", {}).get("coverUrl", ""):
+                    image_url = item["videoMeta"]["coverUrl"]
                 elif item.get("covers", {}).get("default", ""):
                     image_url = item["covers"]["default"]
+                elif item.get("cover", ""):
+                    image_url = item["cover"]
 
                 Actor.log.info(f"TikTok scraper got caption: {len(caption)} chars")
+                Actor.log.info(f"TikTok scraper got image: {'yes' if image_url else 'no'}")
                 return {
                     "caption": caption,
                     "image_url": image_url,
