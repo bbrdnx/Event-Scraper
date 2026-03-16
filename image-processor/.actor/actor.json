@@ -1,0 +1,12 @@
+{
+    "actorSpecification": 1,
+    "name": "image-processor",
+    "title": "Event Image Processor",
+    "description": "Downloads event images from CDN URLs and uploads to Supabase for permanent storage. Re-scrapes if CDN URLs have expired.",
+    "version": "0.1",
+    "meta": {
+        "templateId": "python-start"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "./Dockerfile"
+}
