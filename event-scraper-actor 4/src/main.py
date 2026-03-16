@@ -8,11 +8,74 @@ import asyncio
 import base64
 import json
 import re
+import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
 from apify import Actor
+
+
+# ── Supabase image storage ─────────────────────────────────────────────────
+
+async def upload_image_to_supabase(client, image_url, supabase_url, supabase_key, platform="unknown"):
+    """Download an image from a CDN URL and upload it to Supabase storage.
+    Returns the permanent public URL, or empty string on failure."""
+    if not image_url:
+        return ""
+
+    try:
+        # Download the image
+        img_resp = await client.get(image_url, follow_redirects=True, timeout=30)
+        if img_resp.status_code != 200:
+            Actor.log.warning(f"Could not download image: HTTP {img_resp.status_code}")
+            return ""
+
+        # Determine file extension from content type
+        content_type = img_resp.headers.get("content-type", "image/jpeg")
+        if "png" in content_type:
+            ext = "png"
+            mime = "image/png"
+        elif "webp" in content_type:
+            ext = "webp"
+            mime = "image/webp"
+        elif "gif" in content_type:
+            ext = "gif"
+            mime = "image/gif"
+        else:
+            ext = "jpg"
+            mime = "image/jpeg"
+
+        # Generate a unique filename
+        unique_id = uuid.uuid4().hex[:12]
+        timestamp = datetime.now().strftime("%Y%m%d")
+        filename = f"{platform}/{timestamp}_{unique_id}.{ext}"
+
+        # Upload to Supabase storage
+        upload_url = f"{supabase_url}/storage/v1/object/event-images/{filename}"
+        upload_resp = await client.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": mime,
+                "x-upsert": "true",
+            },
+            content=img_resp.content,
+            timeout=30,
+        )
+
+        if upload_resp.status_code in (200, 201):
+            # Build the public URL
+            public_url = f"{supabase_url}/storage/v1/object/public/event-images/{filename}"
+            Actor.log.info(f"Image uploaded to Supabase: {filename}")
+            return public_url
+        else:
+            Actor.log.warning(f"Supabase upload failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}")
+            return ""
+
+    except Exception as e:
+        Actor.log.warning(f"Image upload to Supabase failed: {e}")
+        return ""
 
 
 # ── Notion helpers ──────────────────────────────────────────────────────────
@@ -528,6 +591,8 @@ async def main():
         notion_database_id = actor_input.get("notion_database_id")
         claude_api_key = actor_input.get("claude_api_key")
         apify_token = actor_input.get("apify_token")
+        supabase_url = actor_input.get("supabase_url", "")
+        supabase_key = actor_input.get("supabase_key", "")
 
         if not all([notion_api_key, notion_database_id, claude_api_key, apify_token]):
             Actor.log.error(
@@ -536,6 +601,11 @@ async def main():
             )
             await Actor.fail()
             return
+
+        if supabase_url and supabase_key:
+            Actor.log.info("Supabase storage enabled — images will be uploaded")
+        else:
+            Actor.log.info("Supabase not configured — using CDN URLs for images")
 
         async with httpx.AsyncClient(timeout=60) as client:
             # 1. Fetch pending entries from Notion
@@ -644,8 +714,15 @@ async def main():
 
                     # Process each event found
                     for i, event_data in enumerate(events_list):
-                        # Add image URL to the data
-                        event_data["image_url"] = scraped.get("image_url", "")
+                        # Upload image to Supabase if configured, otherwise use CDN URL
+                        raw_image_url = scraped.get("image_url", "")
+                        if raw_image_url and supabase_url and supabase_key:
+                            permanent_url = await upload_image_to_supabase(
+                                client, raw_image_url, supabase_url, supabase_key, platform.lower()
+                            )
+                            event_data["image_url"] = permanent_url if permanent_url else raw_image_url
+                        else:
+                            event_data["image_url"] = raw_image_url
 
                         # Build Notion properties
                         properties = build_notion_properties(event_data)
