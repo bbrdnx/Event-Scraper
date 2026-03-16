@@ -1,0 +1,41 @@
+{
+    "title": "Image Processor Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "notion_api_key": {
+            "title": "Notion API Key",
+            "type": "string",
+            "description": "Your Notion integration API key (starts with ntn_)",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "notion_database_id": {
+            "title": "Notion Database ID",
+            "type": "string",
+            "description": "The ID of your Event Tracker database in Notion",
+            "editor": "textfield"
+        },
+        "apify_token": {
+            "title": "Apify API Token",
+            "type": "string",
+            "description": "Your Apify API token — needed to re-scrape expired CDN URLs",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "supabase_url": {
+            "title": "Supabase Project URL",
+            "type": "string",
+            "description": "Your Supabase project URL (e.g. https://abc123.supabase.co)",
+            "editor": "textfield"
+        },
+        "supabase_key": {
+            "title": "Supabase Service Role Key",
+            "type": "string",
+            "description": "Your Supabase service_role key (found in Settings > API)",
+            "editor": "textfield",
+            "isSecret": true
+        }
+    },
+    "required": ["notion_api_key", "notion_database_id", "supabase_url", "supabase_key"]
+}
