@@ -1,797 +1,837 @@
+#!/usr/bin/env python3
 """
-Event Scraper Actor for Apify
-Reads pending URLs from Notion, scrapes event data, uses OCR + Claude AI
-to extract structured event information, and updates the Notion database.
+Event Scraper — Supabase Version
+Reads Pending events from Supabase, scrapes content from Instagram/TikTok/websites,
+extracts structured event data using Claude AI, and writes results back to Supabase.
+
+Input fields:
+  supabase_url    - Supabase project URL (https://xxx.supabase.co)
+  supabase_key         - Supabase service_role key
+  claude_api_key       - Anthropic API key (sk-ant-...)
+  apify_token          - Apify API token
+  r2_account_id        - Cloudflare account ID
+  r2_access_key_id     - R2 API access key ID
+  r2_secret_access_key - R2 API secret access key
 """
 
 import asyncio
-import base64
 import json
-import re
-import uuid
+import base64
+import time
+import threading
+import requests
 from datetime import datetime
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import httpx
+from apify_client import ApifyClient
 from apify import Actor
+import anthropic
 
 
-# ── Supabase image storage ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Supabase helpers
+# ---------------------------------------------------------------------------
 
-async def upload_image_to_supabase(client, image_url, supabase_url, supabase_key, platform="unknown"):
-    """Download an image from a CDN URL and upload it to Supabase storage.
-    Returns the permanent public URL, or empty string on failure."""
-    if not image_url:
-        return ""
-
-    try:
-        # Download the image
-        img_resp = await client.get(image_url, follow_redirects=True, timeout=30)
-        if img_resp.status_code != 200:
-            Actor.log.warning(f"Could not download image: HTTP {img_resp.status_code}")
-            return ""
-
-        # Determine file extension from content type
-        content_type = img_resp.headers.get("content-type", "image/jpeg")
-        if "png" in content_type:
-            ext = "png"
-            mime = "image/png"
-        elif "webp" in content_type:
-            ext = "webp"
-            mime = "image/webp"
-        elif "gif" in content_type:
-            ext = "gif"
-            mime = "image/gif"
-        else:
-            ext = "jpg"
-            mime = "image/jpeg"
-
-        # Generate a unique filename
-        unique_id = uuid.uuid4().hex[:12]
-        timestamp = datetime.now().strftime("%Y%m%d")
-        filename = f"{platform}/{timestamp}_{unique_id}.{ext}"
-
-        # Upload to Supabase storage
-        upload_url = f"{supabase_url}/storage/v1/object/event-images/{filename}"
-        upload_resp = await client.post(
-            upload_url,
-            headers={
-                "Authorization": f"Bearer {supabase_key}",
-                "Content-Type": mime,
-                "x-upsert": "true",
-            },
-            content=img_resp.content,
-            timeout=30,
-        )
-
-        if upload_resp.status_code in (200, 201):
-            # Build the public URL
-            public_url = f"{supabase_url}/storage/v1/object/public/event-images/{filename}"
-            Actor.log.info(f"Image uploaded to Supabase: {filename}")
-            return public_url
-        else:
-            Actor.log.warning(f"Supabase upload failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}")
-            return ""
-
-    except Exception as e:
-        Actor.log.warning(f"Image upload to Supabase failed: {e}")
-        return ""
-
-
-# ── Notion helpers ──────────────────────────────────────────────────────────
-
-async def notion_request(client, method, endpoint, api_key, body=None):
-    """Make a request to the Notion API."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
+def make_headers(key):
+    return {
+        'apikey': key,
+        'Authorization': f'Bearer {key}',
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal',
     }
-    url = f"https://api.notion.com/v1{endpoint}"
-    if method == "GET":
-        resp = await client.get(url, headers=headers)
-    elif method == "POST":
-        resp = await client.post(url, headers=headers, json=body)
-    elif method == "PATCH":
-        resp = await client.patch(url, headers=headers, json=body)
-    if resp.status_code >= 400:
-        try:
-            error_data = resp.json()
-            Actor.log.error(f"Notion API error: {error_data.get('message', resp.text)}")
-        except Exception:
-            Actor.log.error(f"Notion API error: {resp.text}")
+
+
+def get_pending_events(supabase_url, headers):
+    """Fetch new events that need scraping (Pending status)."""
+    resp = requests.get(
+        f'{supabase_url}/rest/v1/events',
+        headers={**headers, 'Prefer': 'return=representation'},
+        params={'scrape_status': 'eq.Pending', 'select': '*', 'order': 'created_at.asc', 'limit': '50'},
+        timeout=30,
+    )
     resp.raise_for_status()
     return resp.json()
 
 
-async def get_pending_entries(client, database_id, api_key):
-    """Fetch all entries with Scrape Status = Pending from Notion."""
-    body = {
-        "filter": {
-            "property": "Scrape Status",
-            "select": {"equals": "Pending"},
-        }
-    }
-    result = await notion_request(
-        client, "POST", f"/databases/{database_id}/query", api_key, body
+def get_flagged_events(supabase_url, headers, limit=20):
+    """Fetch previously failed events for retry, oldest first."""
+    resp = requests.get(
+        f'{supabase_url}/rest/v1/events',
+        headers={**headers, 'Prefer': 'return=representation'},
+        params={'scrape_status': 'eq.Flagged', 'select': '*', 'order': 'updated_at.asc', 'limit': str(limit)},
+        timeout=30,
     )
-    return result.get("results", [])
+    resp.raise_for_status()
+    return resp.json()
 
 
-async def update_notion_entry(client, page_id, api_key, properties):
-    """Update a Notion page with extracted event data."""
-    body = {"properties": properties}
-    await notion_request(client, "PATCH", f"/pages/{page_id}", api_key, body)
+def update_event(event_id, data, supabase_url, headers):
+    resp = requests.patch(
+        f'{supabase_url}/rest/v1/events',
+        headers=headers,
+        params={'id': f'eq.{event_id}'},
+        json=data,
+        timeout=30,
+    )
+    resp.raise_for_status()
 
 
-async def create_notion_entry(client, database_id, api_key, properties):
-    """Create a new Notion page in the database."""
-    body = {
-        "parent": {"database_id": database_id},
-        "properties": properties,
+def insert_event(data, supabase_url, headers):
+    resp = requests.post(
+        f'{supabase_url}/rest/v1/events',
+        headers={**headers, 'Prefer': 'return=representation'},
+        json=data,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+def match_or_create_host(event_id, host_name, host_instagram, supabase_url, headers):
+    """Call the match_or_create_host Postgres function to link a host to an event."""
+    if not host_name:
+        return None
+    payload = {
+        'p_event_id': event_id,
+        'p_host_name': host_name,
     }
-    return await notion_request(client, "POST", "/pages", api_key, body)
+    if host_instagram:
+        payload['p_instagram'] = host_instagram
+    resp = requests.post(
+        f'{supabase_url}/rest/v1/rpc/match_or_create_host',
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
-def build_notion_properties(data):
-    """Convert extracted event data into Notion property format."""
-    props = {}
-
-    if data.get("event_name"):
-        props["Event Name"] = {
-            "title": [{"text": {"content": data["event_name"][:200]}}]
-        }
-    if data.get("event_location"):
-        props["Event Location"] = {
-            "rich_text": [{"text": {"content": data["event_location"][:200]}}]
-        }
-    if data.get("city"):
-        props["City"] = {
-            "rich_text": [{"text": {"content": data["city"][:100]}}]
-        }
-    if data.get("state"):
-        props["State/Province"] = {
-            "rich_text": [{"text": {"content": data["state"][:100]}}]
-        }
-    if data.get("country"):
-        props["Country"] = {
-            "rich_text": [{"text": {"content": data["country"][:100]}}]
-        }
-    if data.get("region"):
-        props["Region"] = {"select": {"name": data["region"]}}
-    if data.get("event_date"):
-        props["Event Date"] = {"date": {"start": data["event_date"]}}
-    if data.get("event_time"):
-        props["Event Time"] = {
-            "rich_text": [{"text": {"content": data["event_time"][:100]}}]
-        }
-    if data.get("description"):
-        props["Description"] = {
-            "rich_text": [{"text": {"content": data["description"][:2000]}}]
-        }
-    if data.get("image_url"):
-        props["Image URL"] = {"url": data["image_url"]}
-    if data.get("host"):
-        props["Host"] = {
-            "rich_text": [{"text": {"content": data["host"][:200]}}]
-        }
-    if data.get("host_handle"):
-        props["Host Handle"] = {
-            "rich_text": [{"text": {"content": data["host_handle"][:100]}}]
-        }
-    if data.get("host_platform"):
-        props["Host Platform"] = {"select": {"name": data["host_platform"]}}
-    if data.get("event_category"):
-        props["Event Category"] = {
-            "multi_select": [{"name": data["event_category"]}]
-        }
-
-    # Determine data quality
-    missing = []
-    if not data.get("city") or not data.get("country"):
-        missing.append("Missing Location")
-    if not data.get("event_date"):
-        missing.append("Missing Date")
-
-    if missing:
-        props["Data Quality"] = {"select": {"name": missing[0]}}
-    else:
-        props["Data Quality"] = {"select": {"name": "Complete"}}
-
-    props["Scrape Status"] = {"select": {"name": "Scraped"}}
-
-    return props
+# Host-related fields that Claude may return but should NOT be written to events table
+HOST_FIELDS = {'host_name', 'host_handle', 'host_platform', 'host_instagram'}
 
 
-# ── Platform detection ──────────────────────────────────────────────────────
+def strip_host_fields(data):
+    """Remove host fields from event data before writing to events table."""
+    return {k: v for k, v in data.items() if k not in HOST_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# URL / platform helpers
+# ---------------------------------------------------------------------------
 
 def detect_platform(url):
-    """Detect whether a URL is from Instagram, TikTok, or a website."""
-    domain = urlparse(url).netloc.lower()
-    if "instagram.com" in domain or "instagr.am" in domain:
-        return "Instagram"
-    elif "tiktok.com" in domain:
-        return "TikTok"
-    else:
-        return "Website"
+    if not url:
+        return None
+    u = url.lower()
+    if 'instagram.com' in u:
+        return 'Instagram'
+    if 'tiktok.com' in u:
+        return 'TikTok'
+    return 'Website'
 
 
-# ── Scraping functions ──────────────────────────────────────────────────────
+def clean_url(url):
+    """Fix doubled URLs from iOS Shortcut and strip Instagram tracking params."""
+    if not url:
+        return url
+    url = url.strip()
+    # iOS Shortcut sometimes doubles the URL
+    if url.count('http') > 1:
+        url = url[:url.index('http', 4)]
+    # Strip Instagram tracking query params
+    if 'instagram.com' in url and '?' in url:
+        url = url.split('?')[0]
+    return url
 
-async def scrape_instagram(client, url, apify_token):
-    """Scrape Instagram post data using Apify's Instagram Scraper."""
-    try:
-        # Clean the URL — remove tracking params that cause issues
-        clean_url = url.split("?")[0] + "/" if not url.split("?")[0].endswith("/") else url.split("?")[0]
 
-        resp = await client.post(
-            "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items",
-            params={"token": apify_token},
-            json={
-                "directUrls": [clean_url],
-                "resultsLimit": 1,
-            },
-            timeout=120,
-        )
-        if resp.status_code in (200, 201):
-            items = resp.json()
-            if items and len(items) > 0:
+# ---------------------------------------------------------------------------
+# Scrapers
+# ---------------------------------------------------------------------------
+
+# Rate limiter for Instagram scraping — ensures at least INSTAGRAM_DELAY seconds
+# between calls across all threads to avoid triggering Instagram rate limits.
+INSTAGRAM_DELAY = 3  # seconds between Instagram scrape calls
+_ig_lock = threading.Lock()
+_ig_last_call = 0.0
+
+
+def _instagram_rate_limit():
+    """Block until enough time has passed since the last Instagram scrape call."""
+    global _ig_last_call
+    with _ig_lock:
+        now = time.monotonic()
+        wait = INSTAGRAM_DELAY - (now - _ig_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _ig_last_call = time.monotonic()
+
+
+def scrape_instagram(apify_token, url, retries=2):
+    """Scrape an Instagram post, retrying on failure since the scraper intermittently times out."""
+    for attempt in range(retries):
+        try:
+            _instagram_rate_limit()
+            client = ApifyClient(apify_token)
+            run = client.actor('apify/instagram-scraper').call(
+                run_input={'directUrls': [url], 'resultsType': 'posts', 'resultsLimit': 1},
+                timeout_secs=180,
+            )
+            items = list(client.dataset(run['defaultDatasetId']).iterate_items())
+            if items:
                 item = items[0]
-                
-                # Check if it's an error-only response
-                if item.get("error") and not item.get("caption"):
-                    Actor.log.warning(f"Instagram returned error: {item.get('error')} - {item.get('errorDescription', '')}")
-                else:
-                    caption = item.get("caption", "") or ""
-                    post_type = item.get("type", "").lower()
-
-                    # Get image/thumbnail URL based on post type
-                    image_url = ""
-
-                    # 1. Direct display URL (works for Image and Sidecar posts)
-                    if item.get("displayUrl"):
-                        image_url = item["displayUrl"]
-
-                    # 2. For video/reel posts, grab the thumbnail
-                    if not image_url and item.get("videoUrl"):
-                        # Videos have a thumbnail in displayUrl usually,
-                        # but if not, check other fields
-                        if item.get("previewUrl"):
-                            image_url = item["previewUrl"]
-
-                    # 3. Check images array (carousel/sidecar posts)
-                    if not image_url and item.get("images") and len(item["images"]) > 0:
-                        image_url = item["images"][0]
-
-                    # 4. Check childPosts for carousel first image
-                    if not image_url and item.get("childPosts") and len(item["childPosts"]) > 0:
-                        first_child = item["childPosts"][0]
-                        image_url = first_child.get("displayUrl", "") or first_child.get("imageUrl", "")
-
-                    # Get owner info
-                    owner_username = item.get("ownerUsername", "") or ""
-
-                    Actor.log.info(f"Instagram scraper got caption: {len(caption)} chars")
-                    Actor.log.info(f"Instagram scraper got image: {'yes' if image_url else 'no'}")
-                    Actor.log.info(f"Instagram post type: {post_type}")
-                    return {
-                        "caption": caption,
-                        "image_url": image_url,
-                        "author": owner_username,
-                    }
-        else:
-            # Log the actual error for debugging
-            try:
-                error_body = resp.json()
-                Actor.log.warning(f"Instagram scraper status {resp.status_code}: {error_body}")
-            except Exception:
-                Actor.log.warning(f"Instagram scraper returned status {resp.status_code}")
-    except Exception as e:
-        Actor.log.warning(f"Instagram Apify scraper failed: {e}")
-
-    # Fallback: try oEmbed
-    try:
-        oembed_url = f"https://api.instagram.com/oembed/?url={url}"
-        resp = await client.get(oembed_url, follow_redirects=True)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "caption": data.get("title", ""),
-                "image_url": data.get("thumbnail_url", ""),
-                "author": data.get("author_name", ""),
-            }
-    except Exception:
-        pass
-
-    return {"caption": "", "image_url": "", "author": ""}
-
-
-async def scrape_tiktok(client, url, apify_token):
-    """Scrape TikTok post data using Apify's TikTok Scraper."""
-    try:
-        # Call clockworks' TikTok Scraper
-        resp = await client.post(
-            "https://api.apify.com/v2/acts/clockworks~free-tiktok-scraper/run-sync-get-dataset-items",
-            params={"token": apify_token},
-            json={
-                "postURLs": [url],
-                "resultsPerPage": 1,
-            },
-            timeout=120,
-        )
-        if resp.status_code in (200, 201):
-            items = resp.json()
-            if items and len(items) > 0:
-                item = items[0]
-                caption = item.get("text", "") or item.get("desc", "") or ""
-                image_url = ""
-
-                # TikTok videos always have cover/thumbnail images
-                if item.get("videoMeta", {}).get("coverUrl", ""):
-                    image_url = item["videoMeta"]["coverUrl"]
-                elif item.get("covers", {}).get("default", ""):
-                    image_url = item["covers"]["default"]
-                elif item.get("cover", ""):
-                    image_url = item["cover"]
-
-                Actor.log.info(f"TikTok scraper got caption: {len(caption)} chars")
-                Actor.log.info(f"TikTok scraper got image: {'yes' if image_url else 'no'}")
                 return {
-                    "caption": caption,
-                    "image_url": image_url,
-                    "author": item.get("authorMeta", {}).get("name", ""),
+                    'text': item.get('caption', ''),
+                    'image_url': item.get('displayUrl') or (item.get('images') or [None])[0],
+                    'author': item.get('ownerUsername', ''),
                 }
+            # Empty result — retry if we have attempts left
+            if attempt < retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s backoff
+                print(f'  Instagram scraper returned empty, waiting {wait}s before retry ({attempt + 1}/{retries})...')
+                time.sleep(wait)
+                continue
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f'  Instagram scrape failed ({e}), waiting {wait}s before retry ({attempt + 1}/{retries})...')
+                time.sleep(wait)
+                continue
+            raise
+    return {'text': '', 'image_url': None, 'author': ''}
 
-        Actor.log.warning(f"TikTok scraper returned status {resp.status_code}")
-    except Exception as e:
-        Actor.log.warning(f"TikTok Apify scraper failed: {e}")
 
-    # Fallback: try oEmbed
+def scrape_tiktok(apify_token, url, retries=2):
+    """Scrape a TikTok post, retrying on failure."""
+    for attempt in range(retries):
+        try:
+            client = ApifyClient(apify_token)
+            run = client.actor('clockworks/free-tiktok-scraper').call(
+                run_input={'postURLs': [url], 'resultsPerPage': 1},
+                timeout_secs=180,
+            )
+            items = list(client.dataset(run['defaultDatasetId']).iterate_items())
+            if items:
+                item = items[0]
+                return {
+                    'text': item.get('text', '') or item.get('desc', ''),
+                    'image_url': (item.get('videoMeta') or {}).get('coverUrl'),
+                    'author': (item.get('authorMeta') or {}).get('name', ''),
+                }
+            if attempt < retries - 1:
+                print(f'  TikTok scraper returned empty, retrying ({attempt + 1}/{retries})...')
+                continue
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f'  TikTok scrape failed ({e}), retrying ({attempt + 1}/{retries})...')
+                continue
+            raise
+    return {'text': '', 'image_url': None, 'author': ''}
+
+
+def scrape_website(url):
     try:
-        oembed_url = f"https://www.tiktok.com/oembed?url={url}"
-        resp = await client.get(oembed_url, follow_redirects=True)
-        if resp.status_code == 200:
-            data = resp.json()
-            return {
-                "caption": data.get("title", ""),
-                "image_url": data.get("thumbnail_url", ""),
-                "author": data.get("author_name", ""),
-            }
-    except Exception:
-        pass
-
-    return {"caption": "", "image_url": "", "author": ""}
-
-
-async def scrape_website(client, url):
-    """Scrape generic website for event information."""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = await client.get(url, headers=headers, follow_redirects=True, timeout=30)
-        text = resp.text
-
-        # Extract useful meta/content
-        title = ""
-        description = ""
-        image_url = ""
-
-        title_match = re.search(r"<title>([^<]*)</title>", text, re.IGNORECASE)
-        og_desc = re.search(r'<meta property="og:description" content="([^"]*)"', text)
-        meta_desc = re.search(r'<meta name="description" content="([^"]*)"', text)
-        og_image = re.search(r'<meta property="og:image" content="([^"]*)"', text)
-
-        if title_match:
-            title = title_match.group(1).strip()
-        if og_desc:
-            description = og_desc.group(1)
-        elif meta_desc:
-            description = meta_desc.group(1)
-        if og_image:
-            image_url = og_image.group(1)
-
-        # Also grab visible text (simplified)
-        body_text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
-        body_text = re.sub(r"<style[^>]*>.*?</style>", "", body_text, flags=re.DOTALL)
-        body_text = re.sub(r"<[^>]+>", " ", body_text)
-        body_text = re.sub(r"\s+", " ", body_text).strip()[:3000]
-
+        resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+        resp.raise_for_status()
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        title = soup.find('title')
+        og_desc = soup.find('meta', property='og:description')
+        og_image = soup.find('meta', property='og:image')
+        body = ' '.join(soup.get_text().split())[:3000]
         return {
-            "caption": f"{title}\n{description}\n{body_text}",
-            "image_url": image_url,
-            "author": "",
+            'text': '\n'.join(filter(None, [
+                title.text.strip() if title else '',
+                og_desc.get('content', '') if og_desc else '',
+                body,
+            ])),
+            'image_url': og_image.get('content') if og_image else None,
+            'author': '',
         }
     except Exception as e:
-        Actor.log.warning(f"Website scrape failed: {e}")
-        return {"caption": "", "image_url": "", "author": ""}
+        return {'text': '', 'image_url': None, 'author': '', 'error': str(e)}
 
 
-# ── OCR via Claude Vision ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Claude extraction
+# ---------------------------------------------------------------------------
 
-async def ocr_image(client, image_url, claude_api_key):
-    """Use Claude's vision capability to extract text from an image."""
-    if not image_url:
-        return ""
-
-    try:
-        # Download the image
-        img_resp = await client.get(image_url, follow_redirects=True, timeout=30)
-        if img_resp.status_code != 200:
-            return ""
-
-        content_type = img_resp.headers.get("content-type", "image/jpeg")
-        if "png" in content_type:
-            media_type = "image/png"
-        elif "gif" in content_type:
-            media_type = "image/gif"
-        elif "webp" in content_type:
-            media_type = "image/webp"
-        else:
-            media_type = "image/jpeg"
-
-        img_b64 = base64.b64encode(img_resp.content).decode("utf-8")
-
-        # Send to Claude for OCR
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": claude_api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": img_b64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract ALL text visible in this image. "
-                                    "Focus on event details: event name, date, time, "
-                                    "location, venue, city, address. "
-                                    "Return only the extracted text, no commentary."
-                                ),
-                            },
-                        ],
-                    }
-                ],
-            },
-            timeout=60,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data["content"][0]["text"]
-    except Exception as e:
-        Actor.log.warning(f"OCR failed: {e}")
-
-    return ""
-
-
-# ── AI extraction via Claude ───────────────────────────────────────────────
-
-EXTRACTION_PROMPT = """You are an event data extractor. Given the following text from a social media post or website (combining caption text and OCR from images), extract structured event information.
-
-USER NOTES (HIGHEST PRIORITY — these come directly from the person who saved this event and override any conflicting scraped data):
-{user_notes}
-
-CAPTION/PAGE TEXT:
-{caption}
-
-OCR TEXT FROM IMAGE:
-{ocr_text}
-
-SOURCE URL:
-{url}
-
-IMPORTANT: A single post may contain MULTIPLE events. This happens when:
-- A post lists several different events (e.g. a weekend lineup, a series of shows)
-- A post mentions a date range where each day has a distinct event or performer
-- A flyer shows multiple acts on different dates
-
-If you find multiple distinct events, return one object per event. If it's a single multi-day event (same name, same venue, date range), return ONE object with the start date.
-
-Extract the following fields for each event. If a field cannot be determined, use null.
-When User Notes provide information, ALWAYS use that over scraped data — the user knows details that may not be in the post.
-For event_date, use ISO format (YYYY-MM-DD). If you see a year is missing, assume the nearest upcoming occurrence.
-For region, classify into one of: Southwest US, West Coast, Southeast US, Northeast US, Midwest, Pacific Northwest, International.
-For event_category, classify into one of: Music, Festival, Market, Art, Nightlife, Community, Food & Drink, Sports, Workshop, Family, Wellness, Adult, Other.
-For host_platform, classify into one of: Instagram, TikTok, Website, Facebook, Twitter/X, Threads, Bluesky. Infer this from the source URL or from any social handles mentioned in the caption.
-For host_handle, extract the social media handle WITHOUT the @ symbol.
-Today's date for reference: {today}
-
-Respond ONLY with a valid JSON array, no markdown backticks, no explanation:
-[
-    {{
-        "event_name": "string or null",
-        "event_location": "venue name or null",
-        "city": "string or null",
-        "state": "state/province or null",
-        "country": "string or null",
-        "region": "one of the region options or null",
-        "event_date": "YYYY-MM-DD or null",
-        "event_time": "string like '7:00 PM' or 'Doors at 6, Show at 7' or null",
-        "description": "brief description of the event, max 500 chars",
-        "host": "name of the organizing group or person, or null",
-        "host_handle": "social media handle without @ symbol, or null",
-        "host_platform": "one of the platform options or null",
-        "event_category": "one of the category options or null"
-    }}
-]
-
-Always return an array, even if there is only one event."""
-
-
-async def extract_event_data(client, caption, ocr_text, url, claude_api_key, user_notes=""):
-    """Use Claude to extract structured event data from text. Returns a list of events."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    prompt = EXTRACTION_PROMPT.format(
-        caption=caption or "(no caption)",
-        ocr_text=ocr_text or "(no OCR text)",
-        url=url,
-        user_notes=user_notes or "(no user notes)",
-        today=today,
+def build_system_prompt():
+    today = datetime.now().strftime('%Y-%m-%d')
+    current_year = datetime.now().year
+    date_context = (
+        f"Today's date is {today}. When a post mentions a date without a year "
+        f"(e.g. \"March 15\" or \"Saturday April 5th\"), assume the year is "
+        f"{current_year} unless the content clearly indicates otherwise. "
+        f"Events are almost always upcoming, not in the past.\n\n"
+    )
+    return (
+        "You are an event data extractor for The Lez List, a directory of "
+        "LGBTQ+ events curated for Black queer women.\n\n"
+        + date_context
+        + SYSTEM_PROMPT_BODY
     )
 
+
+SYSTEM_PROMPT_BODY = """Extract structured event data from the provided content and return a JSON array of event objects.
+
+IMPORTANT: User Notes are the HIGHEST PRIORITY data source. If User Notes specify a date, location, or other detail, use that over anything else.
+
+Each event object must have these fields (use null if unknown):
+{
+  "event_name": "string",
+  "description": "string (max 2000 chars, do not truncate mid-sentence)",
+  "start_date": "YYYY-MM-DD or null",
+  "end_date": "YYYY-MM-DD or null",
+  "start_time": "HH:MM:SS or null (24hr format)",
+  "end_time": "HH:MM:SS or null",
+  "city": "string or null",
+  "state": "string (2-letter US abbreviation) or null",
+  "country": "US",
+  "venue_name": "string or null",
+  "address": "string or null",
+  "is_virtual": false,
+  "virtual_link": "string or null",
+  "price": "string or null (e.g. '$20', 'Free', '$10-$25')",
+  "is_free": false,
+  "host_name": "string or null (display name of the event host/organizer, preserve their exact capitalization)",
+  "host_instagram": "string (Instagram handle without @, if visible in post tags or caption) or null",
+  "categories": [],
+  "region": "Southwest US|West Coast|Southeast US|Northeast US|Midwest|Pacific Northwest|North America|Caribbean|South America|Europe|Africa|Asia|South Pacific|Australia or null",
+  "data_quality": "Complete|Missing Location|Missing Date|Incomplete"
+}
+
+Category options (only use these): Activity, Adult, Arts & Culture, Black Pride, Book Club, Community, Dance Party, Day Party, Family, Festival, Food & Drink, Get away, Kickback, Market, Meetup, Open Mic, Other, Outdoors, PRIDE, Singles / Dating, Social, Sports, Teen, Wellness, Workshop
+
+Region guidance:
+- Southwest US: AZ, NM, NV, TX, OK
+- West Coast: CA, OR, WA
+- Southeast US: FL, GA, NC, SC, TN, AL, MS, LA, AR, VA
+- Northeast US: NY, NJ, CT, MA, PA, MD, DC, DE, RI, NH, VT, ME
+- Midwest: IL, OH, MI, MN, WI, MO, IN, KS, NE, IA, ND, SD
+- Pacific Northwest: OR, WA, ID, MT
+- North America: Canada, Mexico, and other non-US mainland North American countries
+- Caribbean: Jamaica, Puerto Rico, Trinidad, Barbados, Bahamas, and other Caribbean islands
+- South America: Brazil, Colombia, Argentina, and other South American countries
+- Europe: UK (including London), France, Germany, Netherlands, and other European countries
+- Africa: Nigeria (including Lagos), Ghana, South Africa, Kenya, and other African countries
+- Asia: Japan, India, Thailand, Philippines, and other Asian countries
+- South Pacific: Hawaii, Fiji, New Zealand, and other South Pacific islands
+- Australia: Australia
+
+Data quality rules:
+- Complete: has event_name + start_date + city
+- Missing Location: has name + date but no city
+- Missing Date: has name + city but no date
+- Incomplete: missing two or more of name/date/city
+
+Multi-event rules:
+- Return MULTIPLE events only when a post clearly lists separate events with different dates or venues
+- A single multi-day event (same name, same venue) = ONE event with start_date and end_date
+- When in doubt, return one event
+
+Return ONLY a valid JSON array. No markdown, no explanation, no code fences."""
+
+
+PLATFORM_FOLDER = {
+    'Instagram': 'instagram',
+    'TikTok': 'tiktok',
+    'Website': 'website',
+}
+
+R2_WORKER_BASE_URL = 'https://lez-list-image-worker.broadnaxux.workers.dev'
+R2_BUCKET = 'lez-list-images'
+
+
+def make_r2_client(account_id, access_key_id, secret_access_key):
+    import boto3
+    from botocore.config import Config
+    return boto3.client(
+        's3',
+        endpoint_url=f'https://{account_id}.r2.cloudflarestorage.com',
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        config=Config(signature_version='s3v4'),
+        region_name='auto',
+    )
+
+
+def download_image(url):
+    """Download an image and return (bytes, content_type). Returns (None, None) on failure."""
     try:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": claude_api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 2000,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
+        resp = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
         if resp.status_code == 200:
-            data = resp.json()
-            text = data["content"][0]["text"].strip()
-            # Clean potential markdown fences
-            text = re.sub(r"^```json\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-            parsed = json.loads(text)
+            ct = resp.headers.get('content-type', 'image/jpeg').split(';')[0].strip()
+            return resp.content, ct
+    except Exception:
+        pass
+    return None, None
 
-            # Normalize: always return a list
-            if isinstance(parsed, dict):
-                return [parsed]
-            elif isinstance(parsed, list):
-                return parsed
-            else:
-                return []
+
+def upload_to_r2(image_bytes, content_type, platform, event_id, r2_client):
+    """Upload image bytes to Cloudflare R2 and return the Worker public URL."""
+    folder = PLATFORM_FOLDER.get(platform, 'other')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    short_id = str(event_id).replace('-', '')[:8]
+    path = f'{folder}/{timestamp}_{short_id}.jpg'
+    try:
+        r2_client.put_object(
+            Bucket=R2_BUCKET,
+            Key=path,
+            Body=image_bytes,
+            ContentType=content_type,
+        )
+        return f'{R2_WORKER_BASE_URL}/{path}'
     except Exception as e:
-        Actor.log.error(f"Claude extraction failed: {e}")
+        print(f'  ⚠ R2 upload failed: {e}')
+        return None
 
-    return []
+
+def fetch_image_as_base64(url):
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            content_type = resp.headers.get('content-type', 'image/jpeg').split(';')[0].strip()
+            return base64.b64encode(resp.content).decode(), content_type
+    except Exception:
+        pass
+    return None, None
 
 
-# ── Main actor logic ────────────────────────────────────────────────────────
+def normalize_multi_event_fields(extracted):
+    """
+    When Claude extracts multiple events from a single post, some shared fields
+    (venue, city, state, region, host_name, host_instagram) often come back
+    populated on event 1 but blank on events 2, 3, etc. This is a Claude
+    extraction gap — the info is there in the post, it just doesn't get
+    repeated for each sub-event.
+
+    This function fills those gaps by propagating any non-null value found
+    across the group. It only fills in blanks — it never overwrites a value
+    Claude already extracted for a specific event.
+
+    Only runs when there are 2+ events (single events are unaffected).
+    """
+    if len(extracted) < 2:
+        return extracted
+
+    # Fields that are typically shared across all events from one post
+    SHARED_FIELDS = [
+        'venue_name', 'city', 'state', 'country', 'address',
+        'region', 'host_name', 'host_instagram',
+    ]
+
+    for field in SHARED_FIELDS:
+        # Find the first non-null, non-empty value across all events
+        fill_value = None
+        for event in extracted:
+            val = event.get(field)
+            if val:
+                fill_value = val
+                break
+        if fill_value is None:
+            continue
+        # Fill blanks in all other events
+        filled = 0
+        for event in extracted:
+            if not event.get(field):
+                event[field] = fill_value
+                filled += 1
+        if filled:
+            print(f'  → Normalized "{field}" across {filled} sub-event(s): {fill_value!r}')
+
+    return extracted
+
+
+def normalize_location_fields(extracted):
+    """
+    Normalize city names and state abbreviations on extracted events.
+    - Resolves city aliases (Philly → Philadelphia, NYC → New York City, etc.)
+    - Converts full state names to 2-letter abbreviations (California → CA)
+    - Trims whitespace
+    - Resolves NYC boroughs to "New York City"
+    """
+    CITY_ALIASES = {
+        'philly': 'Philadelphia', 'phl': 'Philadelphia',
+        # NYC: only alias abbreviations, NOT boroughs/neighborhoods.
+        # Brooklyn, Bronx, Harlem, Queens etc. keep their names.
+        'nyc': 'New York City', 'new york': 'New York City',
+        'la': 'Los Angeles', 'l.a.': 'Los Angeles', 'l.a': 'Los Angeles',
+        'sf': 'San Francisco', 'san fran': 'San Francisco', 'frisco': 'San Francisco',
+        'atl': 'Atlanta', 'the a': 'Atlanta',
+        'dc': 'Washington', 'd.c.': 'Washington', 'd.c': 'Washington',
+        'washington dc': 'Washington', 'washington d.c.': 'Washington',
+        'washington, dc': 'Washington', 'washington, d.c.': 'Washington',
+        'htx': 'Houston', 'h-town': 'Houston',
+        'chi': 'Chicago', 'chi-town': 'Chicago',
+        'nola': 'New Orleans', 'vegas': 'Las Vegas',
+        'mia': 'Miami', 'the d': 'Detroit',
+        'ft. lauderdale': 'Fort Lauderdale', 'ft lauderdale': 'Fort Lauderdale',
+        'ft. worth': 'Fort Worth', 'ft worth': 'Fort Worth',
+        'st. louis': 'St. Louis', 'saint louis': 'St. Louis', 'st louis': 'St. Louis',
+        'st. petersburg': 'St. Petersburg', 'saint petersburg': 'St. Petersburg',
+        'st petersburg': 'St. Petersburg',
+    }
+
+    STATE_TO_ABBR = {
+        'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR',
+        'california': 'CA', 'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE',
+        'florida': 'FL', 'georgia': 'GA', 'hawaii': 'HI', 'idaho': 'ID',
+        'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA', 'kansas': 'KS',
+        'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
+        'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS',
+        'missouri': 'MO', 'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV',
+        'new hampshire': 'NH', 'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY',
+        'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH', 'oklahoma': 'OK',
+        'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+        'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT',
+        'vermont': 'VT', 'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV',
+        'wisconsin': 'WI', 'wyoming': 'WY',
+        'district of columbia': 'DC', 'puerto rico': 'PR',
+        # Canadian provinces
+        'ontario': 'ON', 'quebec': 'QC', 'british columbia': 'BC',
+        'alberta': 'AB', 'manitoba': 'MB', 'nova scotia': 'NS',
+        'new brunswick': 'NB', 'saskatchewan': 'SK',
+    }
+
+    for event in extracted:
+        # Normalize city
+        city = (event.get('city') or '').strip()
+        if city:
+            alias = CITY_ALIASES.get(city.lower())
+            if alias:
+                print(f'  → City normalized: {city!r} → {alias!r}')
+                city = alias
+            event['city'] = city
+
+        # Normalize state
+        state = (event.get('state') or '').strip()
+        if state:
+            upper = state.upper()
+            if len(upper) <= 2:
+                event['state'] = upper
+            else:
+                abbr = STATE_TO_ABBR.get(state.lower())
+                if abbr:
+                    print(f'  → State normalized: {state!r} → {abbr!r}')
+                    event['state'] = abbr
+                else:
+                    event['state'] = state
+
+    return extracted
+
+
+def validate_extracted_dates(extracted):
+    """
+    Sanity-check dates returned by Claude.
+    Flags any event whose start_date is more than 6 months in the past
+    or more than 18 months in the future — almost certainly a year error.
+    Returns a list of warning strings (empty if all dates are fine).
+    """
+    today = datetime.now().date()
+    warnings = []
+    for event in extracted:
+        raw_date = event.get('start_date')
+        if not raw_date:
+            continue
+        try:
+            event_date = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+        except ValueError:
+            warnings.append(f"Unparseable date: {raw_date!r}")
+            continue
+        months_past = (today - event_date).days / 30
+        months_future = (event_date - today).days / 30
+        if months_past > 6:
+            warnings.append(
+                f"Date {raw_date} is {int(months_past)} months in the past — possible year error"
+            )
+        elif months_future > 18:
+            warnings.append(
+                f"Date {raw_date} is {int(months_future)} months in the future — possible year error"
+            )
+    return warnings
+
+
+def extract_with_claude(claude_client, scraped_text, image_url, user_notes):
+    user_content = []
+
+    if user_notes:
+        user_content.append({'type': 'text', 'text': f'USER NOTES (highest priority):\n{user_notes}\n\n'})
+
+    if scraped_text:
+        user_content.append({'type': 'text', 'text': f'SCRAPED TEXT:\n{scraped_text[:4000]}\n\n'})
+
+    # Only send the image to Claude when there's little or no text to extract from.
+    # Most events have all the details in the caption text, so sending the flyer image
+    # just adds latency and token cost without improving extraction quality.
+    has_enough_text = len((scraped_text or '').strip()) > 80 or len((user_notes or '').strip()) > 40
+    if image_url and not has_enough_text:
+        img_b64, content_type = fetch_image_as_base64(image_url)
+        if img_b64:
+            user_content.append({
+                'type': 'image',
+                'source': {'type': 'base64', 'media_type': content_type, 'data': img_b64},
+            })
+            user_content.append({'type': 'text', 'text': 'Extract any event details visible in this image.'})
+
+    if not user_content:
+        return None
+
+    response = claude_client.messages.create(
+        model='claude-sonnet-4-6',
+        max_tokens=2000,
+        system=build_system_prompt(),
+        messages=[{'role': 'user', 'content': user_content}],
+    )
+
+    raw = response.content[0].text.strip()
+    # Strip markdown code fences if present
+    if '```' in raw:
+        parts = raw.split('```')
+        for p in parts:
+            p = p.strip()
+            if p.startswith('json'):
+                p = p[4:].strip()
+            try:
+                return json.loads(p)
+            except Exception:
+                continue
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
+
+def process_event(event, apify_token, claude_client, supabase_url, supabase_key, headers, r2_client, scrape_cache=None):
+    event_id = event['id']
+    source_url = clean_url(event.get('source_url'))
+    image_url = event.get('flyer_url')
+    user_notes = event.get('user_notes') or ''
+
+    print(f'Processing {event_id}: {source_url or "(image only)"}')
+
+    platform = detect_platform(source_url)
+    scraped = {'text': '', 'image_url': image_url, 'author': ''}
+
+    try:
+        if platform:
+            update_event(event_id, {'platform': platform}, supabase_url, headers)
+
+        # Use cached scrape result if the same source_url was already scraped this run
+        scrape_failed = False
+        if scrape_cache is not None and source_url and source_url in scrape_cache:
+            scraped = scrape_cache[source_url]
+            print(f'  Cache hit for {source_url}')
+        elif source_url:
+            try:
+                if platform == 'Instagram':
+                    scraped = scrape_instagram(apify_token, source_url)
+                elif platform == 'TikTok':
+                    scraped = scrape_tiktok(apify_token, source_url)
+                else:
+                    scraped = scrape_website(source_url)
+                # Store in cache for other events with the same URL
+                if scrape_cache is not None:
+                    scrape_cache[source_url] = scraped
+            except Exception as scrape_err:
+                print(f'  ⚠ Scrape failed: {scrape_err}')
+                scrape_failed = True
+
+        # Prefer the event's existing flyer_url if scraper found nothing
+        if not scraped.get('image_url') and image_url:
+            scraped['image_url'] = image_url
+
+        # Even if the scrape failed, try Claude extraction if we have user_notes or an image.
+        # User notes alone are often enough to extract event details.
+        scraped_text = scraped.get('text', '')
+        has_something_to_extract = scraped_text or user_notes or scraped.get('image_url')
+
+        if scrape_failed and not has_something_to_extract:
+            # Nothing to work with — mark as Flagged so the next run retries it
+            update_event(event_id, {'scrape_status': 'Flagged'}, supabase_url, headers)
+            print(f'  ✗ Scrape failed and no fallback data, flagged for retry')
+            return
+
+        extracted = extract_with_claude(
+            claude_client,
+            scraped_text,
+            scraped.get('image_url'),
+            user_notes,
+        )
+
+        if not extracted:
+            update_event(event_id, {'scrape_status': 'Flagged'}, supabase_url, headers)
+            print(f'  ✗ Claude returned nothing, flagged for retry')
+            return
+
+        # Sanity-check extracted dates before writing anything to Supabase.
+        # Catches year errors (e.g. Claude returns 2024 when today is 2026).
+        # If suspicious dates are found, flag the event for manual review instead
+        # of writing bad data — avoids wasted re-scrapes and manual corrections later.
+        date_warnings = validate_extracted_dates(extracted)
+        if date_warnings:
+            for w in date_warnings:
+                print(f'  ⚠ Date warning: {w}')
+            update_event(event_id, {'scrape_status': 'Flagged'}, supabase_url, headers)
+            print(f'  ✗ Suspicious date(s) detected — flagged for manual review')
+            return
+
+        # For multi-event posts, fill shared fields (venue, city, region, host, etc.)
+        # that Claude populated on event 1 but left blank on siblings.
+        extracted = normalize_multi_event_fields(extracted)
+
+        # Normalize location: city aliases (Philly → Philadelphia) and state abbreviations
+        extracted = normalize_location_fields(extracted)
+
+        # First event → update the existing row
+        first = extracted[0]
+
+        # Extract host info before stripping from event payload
+        host_name = first.get('host_name')
+        host_instagram = first.get('host_instagram')
+        # If Claude didn't find an instagram handle, use the scraped author as fallback
+        if scraped.get('author') and not host_instagram and platform in ('Instagram', 'TikTok'):
+            host_instagram = scraped['author']
+
+        first['scrape_status'] = 'Scraped'
+        # Only set flyer_url if the event doesn't already have a permanent image
+        # (Supabase Storage legacy URLs or new R2 Worker URLs)
+        existing_flyer = event.get('flyer_url', '') or ''
+        has_permanent_image = (
+            existing_flyer.startswith(f'{supabase_url}/storage/') or
+            existing_flyer.startswith(R2_WORKER_BASE_URL)
+        )
+        if scraped.get('image_url') and not has_permanent_image:
+            # Upload image directly to R2 for a permanent URL
+            img_bytes, img_ct = download_image(scraped['image_url'])
+            if img_bytes:
+                permanent_url = upload_to_r2(
+                    img_bytes, img_ct or 'image/jpeg', platform, event_id, r2_client
+                )
+                if permanent_url:
+                    first['flyer_url'] = permanent_url
+                    print(f'  ✓ Image uploaded to R2')
+                else:
+                    first['flyer_url'] = scraped['image_url']  # fall back to CDN URL
+            else:
+                first['flyer_url'] = scraped['image_url']  # fall back to CDN URL
+
+        # Strip host fields and write event data
+        update_event(event_id, strip_host_fields(first), supabase_url, headers)
+
+        # Link host via the host directory
+        if host_name:
+            try:
+                result = match_or_create_host(event_id, host_name, host_instagram, supabase_url, headers)
+                if result:
+                    print(f'  → Host: {result.get("host_name")} ({result.get("match_type")})')
+            except Exception as e:
+                print(f'  ⚠ Host matching failed: {e}')
+
+        # Additional events → insert new rows
+        for extra in extracted[1:]:
+            extra_host_name = extra.get('host_name')
+            extra_host_ig = extra.get('host_instagram')
+
+            extra['scrape_status'] = 'Scraped'
+            extra['source_url'] = source_url
+            extra['platform'] = platform
+            if scraped.get('image_url'):
+                extra['flyer_url'] = scraped['image_url']  # placeholder for insert
+
+            new_row = insert_event(strip_host_fields(extra), supabase_url, headers)
+
+            # Upload image to R2 for the newly created event
+            if new_row and scraped.get('image_url'):
+                ex_bytes, ex_ct = download_image(scraped['image_url'])
+                if ex_bytes:
+                    perm_url = upload_to_r2(
+                        ex_bytes, ex_ct or 'image/jpeg', platform, new_row['id'], r2_client
+                    )
+                    if perm_url:
+                        update_event(new_row['id'], {'flyer_url': perm_url}, supabase_url, headers)
+
+            # Link host for the new event
+            if new_row and extra_host_name:
+                try:
+                    match_or_create_host(new_row['id'], extra_host_name, extra_host_ig, supabase_url, headers)
+                except Exception as e:
+                    print(f'  ⚠ Host matching failed for extra event: {e}')
+
+        print(f'  ✓ {len(extracted)} event(s) extracted')
+
+    except Exception as e:
+        print(f'  ✗ Error: {e}')
+        try:
+            update_event(event_id, {'scrape_status': 'Flagged'}, supabase_url, headers)
+        except Exception:
+            pass
+
 
 async def main():
     async with Actor:
-        # Get input configuration
-        actor_input = await Actor.get_input() or {}
-        notion_api_key = actor_input.get("notion_api_key")
-        notion_database_id = actor_input.get("notion_database_id")
-        claude_api_key = actor_input.get("claude_api_key")
-        apify_token = actor_input.get("apify_token")
-        supabase_url = actor_input.get("supabase_url", "")
-        supabase_key = actor_input.get("supabase_key", "")
+        inp = await Actor.get_input() or {}
 
-        if not all([notion_api_key, notion_database_id, claude_api_key, apify_token]):
-            Actor.log.error(
-                "Missing required input: notion_api_key, notion_database_id, "
-                "claude_api_key, or apify_token"
-            )
-            await Actor.fail()
-            return
+        supabase_url = inp.get('supabase_url', '').rstrip('/')
+        supabase_key = inp.get('supabase_key', '')
+        claude_api_key = inp.get('claude_api_key', '')
+        apify_token = inp.get('apify_token', '')
+        r2_account_id = inp.get('r2_account_id', '')
+        r2_access_key_id = inp.get('r2_access_key_id', '')
+        r2_secret_access_key = inp.get('r2_secret_access_key', '')
 
-        if supabase_url and supabase_key:
-            Actor.log.info("Supabase storage enabled — images will be uploaded")
-        else:
-            Actor.log.info("Supabase not configured — using CDN URLs for images")
+        if not all([supabase_url, supabase_key, claude_api_key, apify_token]):
+            raise ValueError('Missing required inputs: supabase_url, supabase_key, claude_api_key, apify_token')
+        if not all([r2_account_id, r2_access_key_id, r2_secret_access_key]):
+            raise ValueError('Missing required R2 inputs: r2_account_id, r2_access_key_id, r2_secret_access_key')
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            # 1. Fetch pending entries from Notion
-            Actor.log.info("Fetching pending entries from Notion...")
-            entries = await get_pending_entries(
-                client, notion_database_id, notion_api_key
-            )
-            Actor.log.info(f"Found {len(entries)} pending entries")
+        headers = make_headers(supabase_key)
+        claude_client = anthropic.Anthropic(api_key=claude_api_key)
+        r2_client = make_r2_client(r2_account_id, r2_access_key_id, r2_secret_access_key)
 
-            if not entries:
-                Actor.log.info("No pending entries to process. Done!")
-                return
+        # Cache scraped results by source_url so duplicate URLs aren't re-scraped.
+        # ThreadPoolExecutor shares memory, so a plain dict works here — only one
+        # thread will scrape a given URL first, and later threads read the cached value.
+        scrape_cache = {}
 
-            # 2. Process each entry
-            success_count = 0
-            fail_count = 0
+        # --- Pass 1: Fresh Pending events (4 workers) ---
+        pending = get_pending_events(supabase_url, headers)
+        print(f'Found {len(pending)} pending events')
 
-            for entry in entries:
-                page_id = entry["id"]
-
-                try:
-                    # Get the source URL from the entry
-                    url_prop = entry.get("properties", {}).get("Source URL", {})
-                    source_url = url_prop.get("url", "")
-
-                    # Get user notes if any
-                    notes_prop = entry.get("properties", {}).get("User Notes", {})
-                    notes_rt = notes_prop.get("rich_text", [])
-                    user_notes = notes_rt[0]["text"]["content"] if notes_rt else ""
-                    if user_notes:
-                        Actor.log.info(f"User notes found: {user_notes[:100]}...")
-
-                    if not source_url:
-                        Actor.log.warning(f"No URL found for page {page_id}, skipping")
-                        await update_notion_entry(
-                            client,
-                            page_id,
-                            notion_api_key,
-                            {"Scrape Status": {"select": {"name": "Failed"}}},
-                        )
-                        fail_count += 1
-                        continue
-
-                    # Fix doubled URLs (iOS Shortcut bug)
-                    halfway = len(source_url) // 2
-                    if (
-                        len(source_url) > 20
-                        and source_url[:halfway] == source_url[halfway:]
-                    ):
-                        source_url = source_url[:halfway]
-                        Actor.log.info(f"Fixed doubled URL: {source_url}")
-
-                    Actor.log.info(f"Processing: {source_url}")
-
-                    # 3. Detect platform and scrape
-                    platform = detect_platform(source_url)
-                    Actor.log.info(f"Platform detected: {platform}")
-
-                    if platform == "Instagram":
-                        scraped = await scrape_instagram(client, source_url, apify_token)
-                    elif platform == "TikTok":
-                        scraped = await scrape_tiktok(client, source_url, apify_token)
-                    else:
-                        scraped = await scrape_website(client, source_url)
-
-                    # 4. OCR on the image if available
-                    ocr_text = ""
-                    if scraped.get("image_url"):
-                        Actor.log.info("Running OCR on image...")
-                        ocr_text = await ocr_image(
-                            client, scraped["image_url"], claude_api_key
-                        )
-                        Actor.log.info(
-                            f"OCR extracted {len(ocr_text)} characters"
-                        )
-
-                    # 5. AI extraction
-                    Actor.log.info("Extracting event data with Claude...")
-                    events_list = await extract_event_data(
-                        client,
-                        scraped.get("caption", ""),
-                        ocr_text,
-                        source_url,
-                        claude_api_key,
-                        user_notes=user_notes,
-                    )
-
-                    if not events_list:
-                        Actor.log.warning(
-                            f"Could not extract event data for {source_url}"
-                        )
-                        await update_notion_entry(
-                            client,
-                            page_id,
-                            notion_api_key,
-                            {
-                                "Scrape Status": {"select": {"name": "Failed"}},
-                            },
-                        )
-                        fail_count += 1
-                        continue
-
-                    Actor.log.info(
-                        f"Found {len(events_list)} event(s) in this entry"
-                    )
-
-                    # Process each event found
-                    for i, event_data in enumerate(events_list):
-                        # Upload image to Supabase if configured, otherwise use CDN URL
-                        raw_image_url = scraped.get("image_url", "")
-                        if raw_image_url and supabase_url and supabase_key:
-                            permanent_url = await upload_image_to_supabase(
-                                client, raw_image_url, supabase_url, supabase_key, platform.lower()
-                            )
-                            event_data["image_url"] = permanent_url if permanent_url else raw_image_url
-                        else:
-                            event_data["image_url"] = raw_image_url
-
-                        # Build Notion properties
-                        properties = build_notion_properties(event_data)
-                        properties["Platform"] = {"select": {"name": platform}}
-                        properties["Source URL"] = {"url": source_url}
-
-                        if i == 0:
-                            # First event: update the original row
-                            await update_notion_entry(
-                                client, page_id, notion_api_key, properties
-                            )
-                            Actor.log.info(
-                                f"Updated original row: "
-                                f"{event_data.get('event_name', 'Unknown Event')}"
-                            )
-                        else:
-                            # Additional events: create new rows
-                            await create_notion_entry(
-                                client,
-                                notion_database_id,
-                                notion_api_key,
-                                properties,
-                            )
-                            Actor.log.info(
-                                f"Created new row for: "
-                                f"{event_data.get('event_name', 'Unknown Event')}"
-                            )
-
-                        # Store result in dataset for logging
-                        await Actor.push_data(
-                            {
-                                "url": source_url,
-                                "platform": platform,
-                                "event_name": event_data.get("event_name"),
-                                "city": event_data.get("city"),
-                                "event_date": event_data.get("event_date"),
-                                "status": "success",
-                                "event_index": i + 1,
-                                "total_events": len(events_list),
-                            }
-                        )
-
-                    Actor.log.info(
-                        f"Successfully processed {len(events_list)} event(s) "
-                        f"from: {source_url}"
-                    )
-                    success_count += 1
-
-                except Exception as e:
-                    Actor.log.error(
-                        f"Error processing page {page_id}: {e}"
-                    )
+        if pending:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(process_event, event, apify_token, claude_client, supabase_url, supabase_key, headers, r2_client, scrape_cache)
+                    for event in pending
+                ]
+                for future in as_completed(futures):
                     try:
-                        await update_notion_entry(
-                            client,
-                            page_id,
-                            notion_api_key,
-                            {
-                                "Scrape Status": {"select": {"name": "Failed"}},
-                            },
-                        )
-                    except Exception:
-                        Actor.log.error(
-                            f"Could not update failure status for {page_id}"
-                        )
-                    fail_count += 1
-                    continue
+                        future.result()
+                    except Exception as e:
+                        print(f'Unhandled error in worker: {e}')
 
-            Actor.log.info(
-                f"Finished: {success_count} succeeded, {fail_count} failed "
-                f"out of {len(entries)} entries"
-            )
+        # --- Pass 2: Flagged retries (2 workers, slower pace) ---
+        # Process flagged events separately with lower concurrency to avoid
+        # the rate-limiting that likely caused them to fail in the first place.
+        flagged = get_flagged_events(supabase_url, headers, limit=20)
+        print(f'Found {len(flagged)} flagged events to retry')
+
+        if flagged:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(process_event, event, apify_token, claude_client, supabase_url, supabase_key, headers, r2_client, scrape_cache)
+                    for event in flagged
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f'Unhandled error in worker: {e}')
+
+        print('Done.')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
